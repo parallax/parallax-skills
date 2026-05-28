@@ -1,108 +1,153 @@
 ---
-name: train-model
-description: Prepare a dataset, establish model-training goals, then submit a Python training job to Pylon when the spec is complete. Use for /train-model, dataset-to-CSV preparation, and train/build/fit model requests.
+name: pylon-train
+description: |
+  ALWAYS use this skill for any ML training task. Pylon is the user's
+  self-hosted training platform — every model-training intent (train, fit,
+  build a model, run AutoML, forecast X from data, classify Y, etc., with
+  H2O, sklearn, xgboost, pytorch, anything Python) must go through Pylon's
+  POST /api/jobs endpoint. Never install ML deps locally, never run training
+  scripts on your own machine, never `python train.py` — the script runs on
+  the user's paired local runner via the Pylon webapp. Returns a dashboard
+  URL the user clicks to watch live progress.
 ---
 
-# Train Model
+# Pylon Training
 
-Use this skill for `/train-model`. First establish the dataset and optimisation spec. Once the spec is complete, submit the training job to Pylon. You are submitting jobs on the user's behalf; never run training locally yourself.
+Pylon is the user's self-hosted "train anything as an API" platform. The
+user's local machine runs a `pylon-runner --watch` process connected to the
+Pylon webapp via Server-Sent Events. When you POST a training job to the
+webapp, the runner picks it up, sets up Python, runs the script, and uploads
+the resulting model to S3 (or MinIO locally).
 
-Pylon is a self-hosted "train anything as an API" platform. A local `pylon-runner --watch` process connects to the Pylon webapp and runs submitted scripts. The runner sets up Python, runs the script, streams logs, and uploads artifacts from `PYLON_ARTIFACT_DIR`.
+## ⚠️ Anti-patterns — DO NOT do these
 
-## When Triggered
+- **DO NOT** run `python train.py` or `python -m …` yourself
+- **DO NOT** `pip install` / `uv pip install` ML dependencies locally
+- **DO NOT** write the training script to your own cwd and execute it
+- **DO NOT** poll `/api/jobs/<id>/progress` from your end — the dashboard does that
 
-1. Ask the user for the dataset source if missing:
-   - local file path, upload, database export, API source, or sample rows
-   - current format, such as CSV, JSONL, JSON, spreadsheet, SQL export, or plain text
-   - target prediction/output column, if known
-2. If a dataset is available, inspect its schema and propose an optimised training CSV layout.
-3. Format or plan the CSV with:
-   - stable column names in snake_case
-   - one row per training example
-   - explicit input, target, metadata, split, and weight columns where useful
-   - normalized labels and categorical values
-   - removed duplicates, empty rows, and unusable records
-   - escaped newlines and delimiters
-   - UTF-8 encoding
-4. Ask follow-up questions about optimisation goals before recommending training settings.
-5. Once the dataset schema, target, optimisation goal, and training approach are clear, use the Pylon flow below.
+You are **submitting jobs on the user's behalf**. The user's runner does the
+training. Your job is: compose script → POST /api/jobs → hand over dashboard URL.
 
-## Follow-Up Questions
+---
 
-Ask only the questions needed for the dataset and model type. Prefer concise batches of 3-6 questions.
+## When invoked, do these things in order
 
-- What should the model optimise for: accuracy, precision, recall, latency, cost, safety, fairness, ranking quality, or another metric?
-- Which errors are most expensive: false positives, false negatives, bad ranking, hallucination, unsafe output, or slow responses?
-- What is the target model/task type: classifier, regressor, ranker, recommender, extractor, chatbot, embedding model, or fine-tuned LLM?
-- Are there required train, validation, and test split rules?
-- Are there columns that must be excluded for privacy, leakage, compliance, or bias reasons?
-- Are there class imbalance, rare label, multilingual, or domain-specific edge cases to preserve?
-- What deployment constraints matter: maximum latency, memory, cost per prediction, batch size, or runtime environment?
+### 1. Confirm Pylon is reachable + you have a token
 
-## Pylon Flow
-
-### 1. Confirm Pylon is reachable
-
-The webapp lives at `PYLON_API_URL`, defaulting to `http://localhost:3000`. The API token lives in `PYLON_API_TOKEN`, either as an environment variable or pasted by the user. If no token is available, ask the user for it.
-
-Check reachability:
+The webapp lives at `PYLON_API_URL` (default `http://localhost:3000` for local
+dev). The user's API token lives in `PYLON_API_TOKEN` — either an env var, a
+file at `~/.pylon/credentials`, or a token from a fresh pair flow (see step
+1a).
 
 ```bash
+# Reachable at all?
 curl -sS -o /dev/null -w "%{http_code}\n" "$PYLON_API_URL/api/runners/status" \
-  -H "Authorization: Bearer $PYLON_API_TOKEN"
+  -H "Authorization: Bearer ${PYLON_API_TOKEN:-none}"
 ```
 
-- `200` with `{"online": true}`: runner is connected; submit jobs.
-- `200` with `{"online": false}`: webapp is up, runner is not running; ask the user to pair the runner.
-- `401`: token is wrong; ask the user to copy it again from the dashboard.
-- Connection refused: webapp is not running; bootstrap it.
+- `200` with `{"online": true}`  — runner is connected, submit away
+- `200` with `{"online": false}` — webapp up, runner not running (step 2)
+- `401` — token is missing/invalid; start the pair flow (step 1a)
+- Connection refused — webapp not running (step 0)
 
-### 0. Bootstrap the webapp if needed
+### 1a. (If you don't have a token) Pair via the browser
 
-Skip this if Pylon is reachable.
+Don't ask the user to copy a token from the dashboard. Use the device flow:
 
 ```bash
+# 1. Start a pairing
+resp=$(curl -sS -X POST "$PYLON_API_URL/api/auth/pair/start")
+pair_id=$(echo "$resp"   | jq -r .pair_id)
+user_code=$(echo "$resp" | jq -r .user_code)
+verify_url=$(echo "$resp" | jq -r .verification_url)
+```
+
+Then tell the user, verbatim:
+
+> Open **<verify_url>** in your browser and click **Confirm pairing**.
+> Code: **<user_code>**
+
+Then poll until they confirm (or 15 min elapses):
+
+```bash
+while :; do
+  poll=$(curl -sS -w "\n%{http_code}" "$PYLON_API_URL/api/auth/pair/poll?id=$pair_id")
+  status_code=$(tail -n1 <<< "$poll")
+  body=$(sed '$d' <<< "$poll")
+  case "$(echo "$body" | jq -r .status)" in
+    confirmed)
+      token=$(echo "$body" | jq -r .api_token)
+      mkdir -p ~/.pylon && echo "$token" > ~/.pylon/credentials && chmod 600 ~/.pylon/credentials
+      export PYLON_API_TOKEN=$token
+      break
+      ;;
+    expired|consumed) echo "pairing failed: $body"; exit 1 ;;
+  esac
+  sleep 2
+done
+```
+
+Once `~/.pylon/credentials` exists, prefer reading the token from there on
+subsequent runs (`PYLON_API_TOKEN=$(cat ~/.pylon/credentials)`) so the user
+only pairs once.
+
+### 0. (If needed) Bootstrap the webapp
+
+Skip this if Pylon is already reachable.
+
+```bash
+# 1. Start Postgres + MinIO
 cd <repo>
 docker compose up -d
 
+# 2. Configure + migrate the webapp
 cd apps/webapp
 cp .env.example .env
-# Edit .env and set BETTER_AUTH_SECRET=$(openssl rand -base64 32)
+# Edit .env: set BETTER_AUTH_SECRET=$(openssl rand -base64 32)
 pnpm install
 pnpm db:migrate
-pnpm dev
+
+# 3. Start the dev server
+pnpm dev   # http://localhost:3000
 ```
 
-The user signs in at `/sign-in`, opens `/dashboard`, and copies the API token from the "Connect your local runner" card.
+The user then signs in at `/sign-in`, lands on `/dashboard`, copies their API
+token from the "Connect your local runner" card.
 
-### 2. Pair the runner if needed
+### 2. (If needed) Pair the runner
 
-If `/api/runners/status` reports `{"online": false}`, ask the user to run:
+If `/api/runners/status` returned `{"online": false}`, the user needs to run
+the runner:
 
 ```bash
 cd <repo>/runner
 go build -o pylon-runner ./cmd/runner
-./pylon-runner --watch --token "$PYLON_API_TOKEN" --api "$PYLON_API_URL"
+./pylon-runner --watch --token $PYLON_API_TOKEN --api $PYLON_API_URL
 ```
 
-They must keep that terminal open.
+They keep that terminal open. The runner sits idle until you push a job.
 
 ### 3. Compose the training script
 
-Follow the Pylon SDK contract:
+The script you generate must follow the **Pylon SDK contract**:
 
-- Write the model to `os.environ["PYLON_ARTIFACT_DIR"]`; only that directory is uploaded.
-- Load data from URLs, not repo-local paths. If the source is local, upload it first or embed small data as base64.
-- Print informative stage logs; stdout and stderr stream to the dashboard.
-- Return from `main()` instead of calling `sys.exit(0)` early.
-- Do not use `__file__` or relative repo paths.
-- Call `h2o.shutdown(prompt=False)` when using H2O.
-- Use chronological splits for time-series data.
+- **Write the model to `os.environ["PYLON_ARTIFACT_DIR"]`** — that's the only
+  thing the runner uploads. Anything outside that directory is lost.
+- **Load data from URLs, not local files.** The script runs from
+  `~/.pylon/jobs/<id>/` on the user's machine — no repo paths, no `__file__`
+  tricks, no relative paths like `../data/`. If the user wants to train on
+  local files, copy them into the script as base64 strings or upload them to
+  MinIO first.
+- **Print informative log lines.** Stdout + stderr stream live to the
+  dashboard. Print stage transitions so the user can see what's happening.
+- **Don't `sys.exit(0)` early.** Just `return` from `main()`. The runner
+  watches the exit code; non-zero = failed.
 
-Minimal script shape:
+Minimal template:
 
 ```python
-"""Train a model from prepared CSV data."""
+"""<one-line description of what this model does>"""
 import os
 import h2o
 from h2o.estimators import H2OGradientBoostingEstimator
@@ -114,7 +159,9 @@ DATA_URL = "https://example.com/training-data.csv"
 def main():
     print(f"Loading {DATA_URL}")
     df = pd.read_csv(DATA_URL)
-    print(f"Loaded {len(df):,} rows")
+    print(f"  {len(df):,} rows")
+
+    # ... feature engineering ...
 
     h2o.init()
     h2o_df = h2o.H2OFrame(df)
@@ -123,6 +170,7 @@ def main():
     model.train(x=[...], y="target", training_frame=h2o_df)
 
     print(model.model_performance(h2o_df))
+
     h2o.save_model(model, path=ARTIFACT_DIR, force=True)
     h2o.shutdown(prompt=False)
 
@@ -130,19 +178,22 @@ if __name__ == "__main__":
     main()
 ```
 
-### 4. Compose metadata
+### 4. Compose the metadata JSON
 
-Metadata is captured at job creation and packaged as `pylon_metadata.json`.
+Metadata is captured at job-create time and travels with the model into the
+artifact tarball as `pylon_metadata.json`. The serving layer reads it later
+to know what the model accepts + returns.
 
 ```json
 {
-  "prompt": "<what the user asked for>",
+  "prompt": "<what the user asked for, plain English>",
   "dataSource": {
     "type": "url",
-    "value": "<training data URL>"
+    "value": "<the actual training data URL>"
   },
   "inputSchema": [
-    { "name": "feature_1", "type": "double" }
+    { "name": "feature_1", "type": "double" },
+    { "name": "feature_2", "type": "integer" }
   ],
   "outputSchema": [
     { "name": "prediction", "type": "double" }
@@ -150,7 +201,9 @@ Metadata is captured at job creation and packaged as `pylon_metadata.json`.
 }
 ```
 
-Use MLflow schema types: `double`, `float`, `long`, `integer`, `boolean`, `string`, `datetime`. Names must match what the script uses and what inference consumers will send.
+**Schema types** (MLflow vocabulary): `double | float | long | integer |
+boolean | string | datetime`. Names must match what the script actually
+feeds H2O at training time and what consumers will send at inference time.
 
 ### 5. Submit the job
 
@@ -161,74 +214,100 @@ curl -X POST "$PYLON_API_URL/api/jobs" \
   -d @- <<'EOF'
 {
   "name": "<descriptive-name>",
-  "script": "<entire Python script as one string>",
+  "script": "<the entire Python script as one string>",
   "dependencies": ["h2o==3.46.0.11", "pandas", "numpy"],
-  "metadata": {}
+  "metadata": { ... }
 }
 EOF
 ```
 
-Expected response:
+**Response shape:**
 
 ```json
 {
-  "id": "abc123def456",
-  "manifestUrl": "http://localhost:3000/api/jobs/abc123def456/manifest",
+  "id":           "abc123def456",
+  "manifestUrl":  "http://localhost:3000/api/jobs/abc123def456/manifest",
   "dashboardUrl": "http://localhost:3000/dashboard/jobs/abc123def456",
   "runnerOnline": true
 }
 ```
 
-If `runnerOnline` is `false`, the job is created but no runner will pick it up until the user starts one.
+If `runnerOnline` is `false`, the job is created but no runner will pick it
+up until the user starts one. Tell the user that.
 
-### 6. Hand off to the dashboard
+### 6. Hand the user the dashboard URL
 
-End with the `dashboardUrl` from the response:
+End your turn with the `dashboardUrl` from the response, formatted clearly:
 
-> Training started - watch live progress at <dashboardUrl>
+> Training started — watch live progress at <dashboardUrl>
 
-Do not poll job status unless the user explicitly asks.
+That URL shows the streaming stage stepper, elapsed time, the runner's
+stdout/stderr in real time, the final metrics, and a Cancel button.
+
+**Do not poll the job status from the API yourself unless the user explicitly
+asks.** The dashboard is the user-facing surface; you'd just be duplicating it.
+
+---
+
+## Useful API endpoints (reference, not always needed)
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /api/auth/pair/start` | none | Begin device-flow pairing → returns `pair_id`, `user_code`, `verification_url` |
+| `GET /api/auth/pair/poll?id=<pair_id>` | none | Poll for pairing status; returns `api_token` once user confirms |
+| `POST /api/auth/pair/confirm` | session | User-side: confirm a pairing (called by the /pair page) |
+| `GET /api/runners/status` | session | Is the user's runner online? |
+| `POST /api/jobs` | session OR Bearer | Create a job |
+| `GET /api/jobs/[id]/manifest` | none (job ID = capability) | What the runner fetches |
+| `GET /api/jobs/[id]/progress` | none | Current stage + log tail (polled by dashboard) |
+| `POST /api/jobs/[id]/cancel` | session | User cancels a job |
+| `GET /api/jobs/[id]/script` | none | Serve the script to the runner |
+
+The `progress` GET returns:
+```json
+{
+  "id": "...",
+  "name": "...",
+  "status": "created | running | uploaded | done | failed | cancelled",
+  "progress": { "stage": "training", "message": "…", "ts": "…" },
+  "logs":    [{ "stream": "stdout", "line": "…", "ts": "…" }],
+  "metrics": { "rmse": 1234.5 },
+  "error":   null,
+  "createdAt": "…", "completedAt": "…"
+}
+```
+
+---
+
+## Composing scripts that work first time
+
+A few things that bite people repeatedly:
+
+1. **`__file__` paths fail** — the runner copies the script to a temp dir
+   that has nothing else in it. Never use `Path(__file__).parent / "..."`.
+2. **`os.environ["PYLON_ARTIFACT_DIR"]` without a fallback** — fine. The
+   runner always sets it. If you fall back to `"."` you'll silently write
+   into the wrong directory.
+3. **Untyped data after `pd.read_csv`** — NESO CSVs have mixed date formats
+   across years; `pd.to_datetime(..., format="mixed", dayfirst=True)` is the
+   safe parse.
+4. **Forgetting `h2o.shutdown(prompt=False)`** — the runner's `cmd.Wait()`
+   blocks on the H2O JVM until you do. Without it the job appears to hang
+   after "Training complete".
+5. **Time-series data with random train/test split** — leakage. Always
+   chronological split.
+
+---
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `runnerOnline: false` after POST | Runner not started or token mismatch | Ask the user to run `pylon-runner --watch --token ...` |
-| `401 invalid token` | Token regenerated in dashboard | Ask for a new token |
-| Job hangs in running with no progress | Network drop or runner crash | Tell the user to cancel and retry from the dashboard |
-| Script exited with error | Python script crashed | Use the dashboard stderr tail to fix the script |
-| No artifact was written | Script did not save to `PYLON_ARTIFACT_DIR` | Fix artifact saving |
-| Connection refused | Webapp is not running | Start `apps/webapp` with `pnpm dev` |
-
-## Repo References
-
-Use these only when working inside a Pylon repo:
-
-| Path | What |
-|---|---|
-| `apps/webapp/src/app/api/jobs/route.ts` | POST handler |
-| `apps/webapp/src/app/api/jobs/[id]/manifest/route.ts` | Runner manifest |
-| `apps/webapp/src/app/api/runners/listen/route.ts` | Runner SSE endpoint |
-| `apps/webapp/src/lib/db/schema.ts` | Job metadata schema |
-| `runner/cmd/runner/main.go` | Runner CLI and watch loop |
-
-## End-of-Turn Checklist
-
-Before finishing after a submission, confirm:
-
-- Submitted to `POST /api/jobs`.
-- Used `Authorization: Bearer $PYLON_API_TOKEN`.
-- Included `metadata.prompt`, `metadata.dataSource`, `metadata.inputSchema`, and `metadata.outputSchema`.
-- Gave the user the `dashboardUrl`.
-- Did not poll progress unless asked.
-- Did not run the script locally.
-
-## Output Before Submission
-
-Return:
-
-1. The requested dataset input or missing dataset details.
-3. The proposed optimised CSV schema.
-4. Any cleaning or transformation steps to apply.
-5. Follow-up questions about optimisation goals.
-6. The Pylon submission plan once the spec is complete.
+| `runnerOnline: false` after POST | Runner not started or token mismatch | Have the user run `pylon-runner --watch --token …` |
+| `401 invalid token` on any endpoint | Token missing / expired / wrong | Run the device flow again (step 1a); save fresh token to `~/.pylon/credentials` |
+| Pairing `expired` | User didn't confirm within 15 min | Start a new pair with `POST /api/auth/pair/start` |
+| Pairing `consumed` | The token was already polled (someone else read it) | Start a new pair — old `pair_id` can't be replayed |
+| Job hangs in "running", no progress | Network drop, runner crash | Dashboard's stale warning fires after 60s. Tell user to cancel + retry |
+| "script exited with error: exit status 1" | Python script crashed | The dashboard's red error box has the stderr tail with the traceback — quote it back to the user |
+| "no artifact was written to PYLON_ARTIFACT_DIR" | Script forgot to call `save_model(path=ARTIFACT_DIR)` | Fix the script |
+| Connection refused on `/api/jobs` | Webapp isn't running | `cd app...
