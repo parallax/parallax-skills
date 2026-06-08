@@ -96,7 +96,7 @@ fi
 
 ```bash
 nohup ~/.pylon/bin/pylon-runner \
-  --watch --api "$PYLON_API_URL" \
+  --watch --token "$PYLON_API_TOKEN" --api "$PYLON_API_URL" \
   > ~/.pylon/runner.log 2>&1 &
 echo $! > ~/.pylon/runner.pid
 disown 2>/dev/null || true
@@ -130,6 +130,6 @@ Run this skill when:
 ## Notes
 
 - Credentials are stored per-URL in `~/.pylon/credentials.json`. The script reads the token for the current `PYLON_API_URL`.
-- The runner no longer requires `--token` on the command line — it reads credentials from the JSON file automatically.
+- The `--watch` binary requires `--token` on the command line. Credentials in `~/.pylon/credentials.json` are used by the MCP server internally; the watch process is always launched with an explicit token.
 - The update is atomic: the install script uses a temp file + `mv` so a failed download never leaves a broken binary.
 - `PYLON_API_URL` defaults to `http://localhost:3000` for local dev; in production the MCP config sets it automatically.

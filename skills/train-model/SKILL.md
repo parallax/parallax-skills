@@ -33,64 +33,73 @@ training. Your job is: compose script → POST /api/jobs → hand over dashboard
 
 ## When invoked, do these things in order
 
-### 1. Confirm Pylon is reachable + you have a token
+### 1. Pair this machine and confirm the runner is online
 
-The webapp lives at `PYLON_API_URL` (default `http://localhost:3000` for local
-dev). The user's API token lives in `PYLON_API_TOKEN` — either an env var, a
-file at `~/.pylon/credentials`, or a token from a fresh pair flow (see step
-1a).
+Call the **`pylon_status`** MCP tool. It handles credential storage, device-flow
+pairing, and launching the watch process automatically. Wait until it confirms
+the runner is online before submitting jobs.
+
+Once `pylon_status` confirms ready, read the saved token for `curl` calls:
 
 ```bash
-# Reachable at all?
-curl -sS -o /dev/null -w "%{http_code}\n" "$PYLON_API_URL/api/runners/status" \
-  -H "Authorization: Bearer ${PYLON_API_TOKEN:-none}"
+export PYLON_API_URL="${PYLON_API_URL:-http://localhost:3000}"
+
+PYLON_API_TOKEN=$(python3 -c "
+import json, os, sys
+f = os.path.expanduser('~/.pylon/credentials.json')
+if not os.path.exists(f): sys.exit(1)
+m = json.load(open(f))
+url = os.environ.get('PYLON_API_URL', 'http://localhost:3000').rstrip('/')
+print(m.get(url.lower(), next(iter(m.values()), '')))
+" 2>/dev/null)
+
+[ -n "$PYLON_API_TOKEN" ] || { echo "No token — run pylon_status first."; exit 1; }
+export PYLON_API_TOKEN
 ```
 
-- `200` with `{"online": true}`  — runner is connected, submit away
-- `200` with `{"online": false}` — webapp up, runner not running (step 2)
-- `401` — token is missing/invalid; start the pair flow (step 1a)
-- Connection refused — webapp not running (step 0)
-
-### 1a. (If you don't have a token) Pair via the browser
-
-Don't ask the user to copy a token from the dashboard. Use the device flow:
+### 1a. (If pylon_status is unavailable) Manual device-flow
 
 ```bash
-# 1. Start a pairing
-resp=$(curl -sS -X POST "$PYLON_API_URL/api/auth/pair/start")
-pair_id=$(echo "$resp"   | jq -r .pair_id)
-user_code=$(echo "$resp" | jq -r .user_code)
-verify_url=$(echo "$resp" | jq -r .verification_url)
-```
+export PYLON_API_URL="${PYLON_API_URL:-http://localhost:3000}"
+mkdir -p ~/.pylon
 
-Then tell the user, verbatim:
+pair=$(curl -sS -X POST "$PYLON_API_URL/api/auth/pair/start")
+pair_id=$(echo "$pair"   | jq -r .pair_id)
+user_code=$(echo "$pair" | jq -r .user_code)
+verify_url=$(echo "$pair" | jq -r .verification_url)
 
-> Open **<verify_url>** in your browser and click **Confirm pairing**.
-> Code: **<user_code>**
+echo ""
+echo "  Open: $verify_url"
+echo "  Code: $user_code"
+echo ""
 
-Then poll until they confirm (or 15 min elapses):
-
-```bash
-while :; do
-  poll=$(curl -sS -w "\n%{http_code}" "$PYLON_API_URL/api/auth/pair/poll?id=$pair_id")
-  status_code=$(tail -n1 <<< "$poll")
-  body=$(sed '$d' <<< "$poll")
-  case "$(echo "$body" | jq -r .status)" in
+for i in $(seq 1 150); do
+  body=$(curl -sS "$PYLON_API_URL/api/auth/pair/poll?id=$pair_id")
+  pylon_state=$(echo "$body" | jq -r .status)
+  case "$pylon_state" in
     confirmed)
-      token=$(echo "$body" | jq -r .api_token)
-      mkdir -p ~/.pylon && echo "$token" > ~/.pylon/credentials && chmod 600 ~/.pylon/credentials
-      export PYLON_API_TOKEN=$token
+      PYLON_API_TOKEN=$(echo "$body" | jq -r .api_token)
+      python3 -c "
+import json, os, sys
+f = os.path.expanduser('~/.pylon/credentials.json')
+m = {}
+if os.path.exists(f):
+  try: m = json.load(open(f))
+  except: pass
+url = os.environ.get('PYLON_API_URL', 'http://localhost:3000').rstrip('/').lower()
+m[url] = sys.argv[1]
+json.dump(m, open(f, 'w'))
+os.chmod(f, 0o600)
+" "$PYLON_API_TOKEN"
       break
       ;;
-    expired|consumed) echo "pairing failed: $body"; exit 1 ;;
+    expired|consumed) echo "pairing failed: $pylon_state"; exit 1 ;;
   esac
   sleep 2
 done
+[ -n "$PYLON_API_TOKEN" ] || { echo "pairing timed out"; exit 1; }
+export PYLON_API_TOKEN
 ```
-
-Once `~/.pylon/credentials` exists, prefer reading the token from there on
-subsequent runs (`PYLON_API_TOKEN=$(cat ~/.pylon/credentials)`) so the user
-only pairs once.
 
 ### 0. (If needed) Bootstrap the webapp
 
@@ -112,21 +121,34 @@ pnpm db:migrate
 pnpm dev   # http://localhost:3000
 ```
 
-The user then signs in at `/sign-in`, lands on `/dashboard`, copies their API
-token from the "Connect your local runner" card.
+The user then signs in at `/sign-in`, lands on `/dashboard`, and adds the MCP
+server from the Connect page. `pylon_status` handles pairing from there.
 
-### 2. (If needed) Pair the runner
+### 2. (Fallback) Manually launch the runner
 
-If `/api/runners/status` returned `{"online": false}`, the user needs to run
-the runner:
+`pylon_status` launches the runner automatically. Only do this if it failed or
+MCP is unavailable:
 
 ```bash
-cd <repo>/runner
-go build -o pylon-runner ./cmd/runner
-./pylon-runner --watch --token $PYLON_API_TOKEN --api $PYLON_API_URL
-```
+online=$(curl -sS "$PYLON_API_URL/api/runners/status" \
+  -H "Authorization: Bearer $PYLON_API_TOKEN" | jq -r .online)
 
-They keep that terminal open. The runner sits idle until you push a job.
+if [ "$online" != "true" ]; then
+  nohup ~/.pylon/bin/pylon-runner \
+    --watch --token "$PYLON_API_TOKEN" --api "$PYLON_API_URL" \
+    > ~/.pylon/runner.log 2>&1 &
+  echo $! > ~/.pylon/runner.pid
+  disown 2>/dev/null || true
+
+  for i in $(seq 1 30); do
+    online=$(curl -sS "$PYLON_API_URL/api/runners/status" \
+      -H "Authorization: Bearer $PYLON_API_TOKEN" | jq -r .online)
+    [ "$online" = "true" ] && break
+    sleep 1
+  done
+  [ "$online" = "true" ] || { echo "runner failed. Logs: tail ~/.pylon/runner.log"; exit 1; }
+fi
+```
 
 ### 3. Compose the training script
 
@@ -304,7 +326,7 @@ A few things that bite people repeatedly:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `runnerOnline: false` after POST | Runner not started or token mismatch | Have the user run `pylon-runner --watch --token …` |
-| `401 invalid token` on any endpoint | Token missing / expired / wrong | Run the device flow again (step 1a); save fresh token to `~/.pylon/credentials` |
+| `401 invalid token` on any endpoint | Token missing / expired / wrong | Call `pylon_status` to re-pair; token is saved to `~/.pylon/credentials.json` |
 | Pairing `expired` | User didn't confirm within 15 min | Start a new pair with `POST /api/auth/pair/start` |
 | Pairing `consumed` | The token was already polled (someone else read it) | Start a new pair — old `pair_id` can't be replayed |
 | Job hangs in "running", no progress | Network drop, runner crash | Dashboard's stale warning fires after 60s. Tell user to cancel + retry |
